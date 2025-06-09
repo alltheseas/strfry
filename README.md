@@ -2,6 +2,8 @@
 
 ![strfry logo](docs/strfry.svg)
 
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/hoytech/strfry)
+
 strfry is a relay for the [nostr protocol](https://github.com/nostr-protocol/nostr)
 
 * Supports most applicable NIPs: 1, 2, 4, 9, 11, 22, 28, 40, 70, 77
