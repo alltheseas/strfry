@@ -1,6 +1,9 @@
 #pragma once
 
 #include <hoytech/protected_queue.h>
+#include <algorithm>
+#include <chrono>
+#include <deque>
 
 #include "golpe.h"
 
@@ -20,6 +23,9 @@ struct WriterPipeline {
     uint64_t writeBatchSize = 1'000;
     bool verifyMsg = true;
     bool verifyTime = true;
+    bool verifyBatchEnabled = true;
+    uint64_t verifyBatchSize = 32;
+    uint64_t verifyBatchFlushMilliseconds = 2;
     bool verboseReject = true;
     bool verboseCommit = true;
     std::function<void(uint64_t)> onCommit;
@@ -54,34 +60,103 @@ struct WriterPipeline {
 
             secp256k1_context *secpCtx = secp256k1_context_create(SECP256K1_CONTEXT_VERIFY);
 
+            BatchVerifier verifier(secpCtx,
+                                   verifyMsg && verifyBatchEnabled,
+                                   verifyBatchSize);
+
+            std::deque<ParsedEventForBatch> pending;
+            auto lastFlush = std::chrono::steady_clock::now();
+            const uint64_t batchTarget = std::max<uint64_t>(1, std::min<uint64_t>(verifyBatchSize, verifier.maxSigs() ? verifier.maxSigs() : verifyBatchSize));
+
+            auto flushPending = [&](bool forceFlush) {
+                if (pending.empty()) return;
+                if (!forceFlush && verifyBatchFlushMilliseconds > 0) {
+                    auto now = std::chrono::steady_clock::now();
+                    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastFlush).count();
+                    if (static_cast<uint64_t>(elapsed) < verifyBatchFlushMilliseconds && pending.size() < batchTarget) return;
+                }
+
+                std::vector<const ParsedEventForBatch*> ptrs;
+                ptrs.reserve(pending.size());
+                for (auto &ev : pending) ptrs.push_back(&ev);
+
+                auto results = verifier.verifyMany(ptrs);
+
+                for (size_t i = 0; i < pending.size(); i++) {
+                    if (results[i] == 1) {
+                        writerInbox.push_move({ std::move(pending[i].packedStr), std::move(pending[i].jsonStr), });
+                        continue;
+                    }
+
+                    if (verboseReject) {
+                        auto preview = pending[i].jsonStr.substr(0, 200);
+                        LW << "Rejected event: " << preview << " reason: bad signature";
+                    }
+
+                    numLive--;
+                    totalRejected++;
+                }
+
+                pending.clear();
+                lastFlush = std::chrono::steady_clock::now();
+            };
+
             while (1) {
                 auto msgs = validatorInbox.pop_all();
 
                 for (auto &m : msgs) {
                     if (m.eventJson.is_null()) {
+                        flushPending(true);
                         shutdownRequested = true;
                         writerInbox.push_move({});
                         shutdownCv.notify_all();
                         return;
                     }
 
-                    std::string packedStr;
-                    std::string jsonStr;
+                    ParsedEventForBatch parsed;
 
                     try {
-                        parseAndVerifyEvent(m.eventJson, secpCtx, verifyMsg, verifyTime, packedStr, jsonStr);
+                        if (verifyMsg) {
+                            parseEventForBatch(m.eventJson, secpCtx, verifyTime, parsed);
+                        } else {
+                            parseAndVerifyEvent(m.eventJson, secpCtx, false, verifyTime, parsed.packedStr, parsed.jsonStr);
+                        }
                     } catch (std::exception &e) {
                         if (verboseReject) {
-                            jsonStr = tao::json::to_string(m.eventJson).substr(0,200);
-                            LW << "Rejected event: " << jsonStr << " reason: " << e.what();
+                            auto preview = tao::json::to_string(m.eventJson).substr(0,200);
+                            LW << "Rejected event: " << preview << " reason: " << e.what();
                         }
                         numLive--;
                         totalRejected++;
                         continue;
                     }
 
-                    writerInbox.push_move({ std::move(packedStr), std::move(jsonStr), });
+                    if (!verifyMsg) {
+                        writerInbox.push_move({ std::move(parsed.packedStr), std::move(parsed.jsonStr), });
+                        continue;
+                    }
+
+                    if (!verifier.available() || !verifyBatchEnabled || verifyBatchSize == 0) {
+                        bool ok = verifier.verifyOne(parsed);
+                        if (ok) {
+                            writerInbox.push_move({ std::move(parsed.packedStr), std::move(parsed.jsonStr), });
+                        } else {
+                            if (verboseReject) {
+                                auto preview = parsed.jsonStr.substr(0, 200);
+                                LW << "Rejected event: " << preview << " reason: bad signature";
+                            }
+                            numLive--;
+                            totalRejected++;
+                        }
+                        continue;
+                    }
+
+                    pending.push_back(std::move(parsed));
+
+                    if (pending.size() >= batchTarget) flushPending(false);
                 }
+
+                flushPending(false);
             }
         });
 
