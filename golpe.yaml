@@ -131,3 +131,12 @@ config:
   - name: events__maxTagValSize
     desc: "Maximum size for tag values, in bytes"
     default: 1024
+  - name: events__verifyBatchEnabled
+    desc: "Enable Schnorr signature batch verification when available"
+    default: true
+  - name: events__verifyBatchSize
+    desc: "Target number of signatures per batch (each Schnorr sig uses 2 terms; capped internally at 53)"
+    default: 32
+  - name: events__verifyBatchFlushMillis
+    desc: "Maximum time to wait before flushing a partially filled verification batch"
+    default: 2
