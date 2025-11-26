@@ -3,6 +3,7 @@
 
 void RelayServer::runIngester(ThreadPool<MsgIngester>::Thread &thr) {
     secp256k1_context *secpCtx = secp256k1_context_create(SECP256K1_CONTEXT_VERIFY);
+    BatchVerifier verifier(secpCtx, cfg().events__verifyBatchEnabled, cfg().events__verifyBatchSize);
     Decompressor decomp;
 
     while(1) {
@@ -29,7 +30,7 @@ void RelayServer::runIngester(ThreadPool<MsgIngester>::Thread &thr) {
                             if (cfg().relay__logging__dumpInEvents) LI << "[" << msg->connId << "] dumpInEvent: " << msg->payload; 
 
                             try {
-                                ingesterProcessEvent(txn, msg->connId, msg->ipAddr, secpCtx, arr[1], writerMsgs);
+                                ingesterProcessEvent(txn, msg->connId, msg->ipAddr, secpCtx, verifier, arr[1], writerMsgs);
                             } catch (std::exception &e) {
                                 sendOKResponse(msg->connId, arr[1].is_object() && arr[1].at("id").is_string() ? arr[1].at("id").get_string() : "?",
                                                false, std::string("invalid: ") + e.what());
@@ -85,12 +86,16 @@ void RelayServer::runIngester(ThreadPool<MsgIngester>::Thread &thr) {
     }
 }
 
-void RelayServer::ingesterProcessEvent(lmdb::txn &txn, uint64_t connId, std::string ipAddr, secp256k1_context *secpCtx, const tao::json::value &origJson, std::vector<MsgWriter> &output) {
-    std::string packedStr, jsonStr;
+void RelayServer::ingesterProcessEvent(lmdb::txn &txn, uint64_t connId, std::string ipAddr, secp256k1_context *secpCtx, BatchVerifier &verifier, const tao::json::value &origJson, std::vector<MsgWriter> &output) {
+    ParsedEventForBatch parsed;
 
-    parseAndVerifyEvent(origJson, secpCtx, true, true, packedStr, jsonStr);
+    parseEventForBatch(origJson, secpCtx, true, parsed);
 
-    PackedEventView packed(packedStr);
+    if (!verifier.verifyOne(parsed)) {
+        throw herr("bad signature");
+    }
+
+    PackedEventView packed(parsed.packedStr);
 
     {
         bool foundProtected = false;
@@ -119,7 +124,7 @@ void RelayServer::ingesterProcessEvent(lmdb::txn &txn, uint64_t connId, std::str
         }
     }
 
-    output.emplace_back(MsgWriter{MsgWriter::AddEvent{connId, std::move(ipAddr), std::move(packedStr), std::move(jsonStr)}});
+    output.emplace_back(MsgWriter{MsgWriter::AddEvent{connId, std::move(ipAddr), std::move(parsed.packedStr), std::move(parsed.jsonStr)}});
 }
 
 void RelayServer::ingesterProcessReq(lmdb::txn &txn, uint64_t connId, const tao::json::value &arr) {

@@ -167,7 +167,7 @@ struct RelayServer {
     void runWebsocket(ThreadPool<MsgWebsocket>::Thread &thr);
 
     void runIngester(ThreadPool<MsgIngester>::Thread &thr);
-    void ingesterProcessEvent(lmdb::txn &txn, uint64_t connId, std::string ipAddr, secp256k1_context *secpCtx, const tao::json::value &origJson, std::vector<MsgWriter> &output);
+    void ingesterProcessEvent(lmdb::txn &txn, uint64_t connId, std::string ipAddr, secp256k1_context *secpCtx, BatchVerifier &verifier, const tao::json::value &origJson, std::vector<MsgWriter> &output);
     void ingesterProcessReq(lmdb::txn &txn, uint64_t connId, const tao::json::value &origJson);
     void ingesterProcessClose(lmdb::txn &txn, uint64_t connId, const tao::json::value &origJson);
     void ingesterProcessNegentropy(lmdb::txn &txn, Decompressor &decomp, uint64_t connId, const tao::json::value &origJson);
