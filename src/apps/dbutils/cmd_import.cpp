@@ -12,7 +12,7 @@
 static const char USAGE[] =
 R"(
     Usage:
-      import [--show-rejected] [--no-verify] [--debounce-millis=<debounce-millis>] [--write-batch=<write-batch>] [--fried]
+      import [--show-rejected] [--no-verify] [--debounce-millis=<debounce-millis>] [--write-batch=<write-batch>] [--verify-batch=<verify-batch>] [--verify-batch-millis=<verify-batch-millis>] [--fried]
 )";
 
 
@@ -45,6 +45,10 @@ void cmd_import(const std::vector<std::string> &subArgs) {
     if (args["--debounce-millis"]) debounceMillis = args["--debounce-millis"].asLong();
     uint64_t writeBatch = fried ? 100'000 : 10'000;
     if (args["--write-batch"]) writeBatch = args["--write-batch"].asLong();
+    uint64_t verifyBatch = cfg().events__verifyBatchSize;
+    if (args["--verify-batch"]) verifyBatch = args["--verify-batch"].asLong();
+    uint64_t verifyBatchMillis = cfg().events__verifyBatchFlushMillis;
+    if (args["--verify-batch-millis"]) verifyBatchMillis = args["--verify-batch-millis"].asLong();
 
     if (noVerify) LW << "not verifying event IDs or signatures!";
 
@@ -54,6 +58,9 @@ void cmd_import(const std::vector<std::string> &subArgs) {
     writer.writeBatchSize = writeBatch;
     writer.verifyMsg = !noVerify;
     writer.verifyTime = false;
+    writer.verifyBatchEnabled = !noVerify && cfg().events__verifyBatchEnabled;
+    writer.verifyBatchSize = verifyBatch;
+    writer.verifyBatchFlushMilliseconds = verifyBatchMillis;
     writer.verboseReject = showRejected;
     writer.verboseCommit = false;
     writer.onCommit = [&](uint64_t numCommitted){

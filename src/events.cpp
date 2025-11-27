@@ -1,5 +1,7 @@
 #include <openssl/sha.h>
 #include <negentropy.h>
+#include <algorithm>
+#include <cstring>
 
 #include "events.h"
 #include "jsonParseUtils.h"
@@ -156,6 +158,144 @@ void parseAndVerifyEvent(const tao::json::value &origJson, secp256k1_context *se
     }));
 
     if (verifyMsg) verifyNostrEventJsonSize(jsonStr);
+}
+
+void parseEventForBatch(const tao::json::value &origJson, secp256k1_context *secpCtx, bool verifyTime, ParsedEventForBatch &out) {
+    if (!origJson.is_object()) throw herr("event is not an object");
+
+    out.packedStr = nostrJsonToPackedEvent(origJson);
+    PackedEventView packed(out.packedStr);
+
+    if (verifyTime) verifyEventTimestamp(packed);
+
+    auto hash = nostrHash(origJson);
+    if (hash != Bytes32(packed.id())) throw herr("bad event id");
+    memcpy(out.msg.data(), hash.buf, sizeof(out.msg));
+
+    out.jsonStr = tao::json::to_string(tao::json::value({
+        { "content", &origJson.at("content") },
+        { "created_at", &origJson.at("created_at") },
+        { "id", &origJson.at("id") },
+        { "kind", &origJson.at("kind") },
+        { "pubkey", &origJson.at("pubkey") },
+        { "sig", &origJson.at("sig") },
+        { "tags", &origJson.at("tags") },
+    }));
+
+    verifyNostrEventJsonSize(out.jsonStr);
+
+    auto sigHex = from_hex(jsonGetString(origJson.at("sig"), "event sig was not a string"), false);
+    if (sigHex.size() != 64) throw herr("unexpected sig size");
+    memcpy(out.sig.data(), sigHex.data(), 64);
+
+    auto pkHex = from_hex(jsonGetString(origJson.at("pubkey"), "event pubkey field was not a string"), false);
+    if (pkHex.size() != 32) throw herr("unexpected pubkey size");
+    memcpy(out.pubkeyBytes.data(), pkHex.data(), 32);
+    if (!secp256k1_xonly_pubkey_parse(secpCtx, &out.pubkey, out.pubkeyBytes.data())) throw herr("verify sig: bad pubkey");
+}
+
+BatchVerifier::BatchVerifier(secp256k1_context *ctxIn, bool enabled, size_t maxSigs) : ctx(ctxIn), batchingEnabled(enabled), maxBatchSigs(maxSigs) {
+#if !STRFRY_HAVE_SECP256K1_BATCH
+    batchAvailable = false;
+    batchingEnabled = false;
+    maxBatchSigs = 0;
+    return;
+#else
+    if (maxBatchSigs > 53) maxBatchSigs = 53; // 2 terms per Schnorr sig, 106-term cap
+    if (!ctx || !enabled || maxBatchSigs == 0) return;
+
+    batch = secp256k1_batch_create(ctx, maxBatchSigs * 2, nullptr);
+    if (!batch) return;
+
+    batchAvailable = true;
+#endif
+}
+
+BatchVerifier::~BatchVerifier() {
+#if STRFRY_HAVE_SECP256K1_BATCH
+    if (batch) secp256k1_batch_destroy(ctx, batch);
+#endif
+}
+
+bool BatchVerifier::verifySingle(const ParsedEventForBatch &ev) {
+    return verifySig(ctx,
+                     std::string_view(reinterpret_cast<const char*>(ev.sig.data()), ev.sig.size()),
+                     std::string_view(reinterpret_cast<const char*>(ev.msg.data()), ev.msg.size()),
+                     std::string_view(reinterpret_cast<const char*>(ev.pubkeyBytes.data()), ev.pubkeyBytes.size()));
+}
+
+void BatchVerifier::ensureBatch(size_t terms) {
+#if !STRFRY_HAVE_SECP256K1_BATCH
+    (void)terms;
+    return;
+#else
+    if (!batchAvailable) return;
+    if (terms * 2 <= maxBatchSigs * 2) return;
+
+    secp256k1_batch_destroy(ctx, batch);
+    batch = secp256k1_batch_create(ctx, terms * 2, nullptr);
+    batchAvailable = batch != nullptr;
+#endif
+}
+
+std::vector<int> BatchVerifier::verifyMany(const std::vector<const ParsedEventForBatch*> &events) {
+    std::vector<int> results(events.size(), 0);
+    if (events.empty()) return results;
+
+    if (!batchingEnabled || !batchAvailable || maxBatchSigs == 0) {
+        for (size_t i = 0; i < events.size(); i++) {
+            results[i] = verifySingle(*events[i]) ? 1 : 0;
+        }
+        return results;
+    }
+#if !STRFRY_HAVE_SECP256K1_BATCH
+    for (size_t i = 0; i < events.size(); i++) {
+        results[i] = verifySingle(*events[i]) ? 1 : 0;
+    }
+    return results;
+#endif
+
+#if STRFRY_HAVE_SECP256K1_BATCH
+    size_t idx = 0;
+    while (idx < events.size()) {
+        size_t slice = std::min(maxBatchSigs, events.size() - idx);
+        ensureBatch(slice);
+        if (!batchAvailable) {
+            for (; idx < events.size(); idx++) {
+                results[idx] = verifySingle(*events[idx]) ? 1 : 0;
+            }
+            break;
+        }
+
+        secp256k1_batch_reset(ctx, batch);
+
+        for (size_t j = 0; j < slice; j++) {
+            const auto &ev = *events[idx + j];
+            secp256k1_batch_add_schnorrsig(ctx, batch, ev.sig.data(), ev.msg.data(), ev.msg.size(), &ev.pubkey);
+        }
+
+        int ok = secp256k1_batch_verify(ctx, batch);
+        if (ok == 1) {
+            for (size_t j = 0; j < slice; j++) {
+                results[idx + j] = 1;
+            }
+        } else {
+            for (size_t j = 0; j < slice; j++) {
+                results[idx + j] = verifySingle(*events[idx + j]) ? 1 : 0;
+            }
+        }
+
+        idx += slice;
+    }
+#endif
+
+    return results;
+}
+
+bool BatchVerifier::verifyOne(const ParsedEventForBatch &ev) {
+    std::vector<const ParsedEventForBatch*> single{ &ev };
+    auto res = verifyMany(single);
+    return res.size() && res[0] == 1;
 }
 
 

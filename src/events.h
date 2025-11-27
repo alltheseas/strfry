@@ -2,6 +2,18 @@
 
 #include <secp256k1_schnorrsig.h>
 
+#if __has_include(<secp256k1_batch.h>)
+#include <secp256k1_batch.h>
+#include <secp256k1_schnorrsig_batch.h>
+#define STRFRY_HAVE_SECP256K1_BATCH 1
+#else
+#pragma message("secp256k1_batch.h not found; falling back to per-signature verification")
+typedef struct secp256k1_batch_struct secp256k1_batch;
+#define STRFRY_HAVE_SECP256K1_BATCH 0
+#endif
+#include <array>
+#include <vector>
+
 #include "golpe.h"
 
 #include "Bytes32.h"
@@ -45,6 +57,39 @@ void verifyNostrEventJsonSize(std::string_view jsonStr);
 void verifyEventTimestamp(PackedEventView packed);
 
 void parseAndVerifyEvent(const tao::json::value &origJson, secp256k1_context *secpCtx, bool verifyMsg, bool verifyTime, std::string &packedStr, std::string &jsonStr);
+
+struct ParsedEventForBatch {
+    std::string packedStr;
+    std::string jsonStr;
+    std::array<unsigned char, 32> msg{};
+    std::array<unsigned char, 64> sig{};
+    std::array<unsigned char, 32> pubkeyBytes{};
+    secp256k1_xonly_pubkey pubkey;
+};
+
+void parseEventForBatch(const tao::json::value &origJson, secp256k1_context *secpCtx, bool verifyTime, ParsedEventForBatch &out);
+
+class BatchVerifier {
+  public:
+    BatchVerifier(secp256k1_context *ctx, bool enabled, size_t maxSigs);
+    ~BatchVerifier();
+
+    bool available() const { return batchAvailable; }
+    size_t maxSigs() const { return maxBatchSigs; }
+
+    bool verifyOne(const ParsedEventForBatch &ev);
+    std::vector<int> verifyMany(const std::vector<const ParsedEventForBatch*> &events);
+
+  private:
+    bool verifySingle(const ParsedEventForBatch &ev);
+    void ensureBatch(size_t terms);
+
+    secp256k1_context *ctx;
+    secp256k1_batch *batch = nullptr;
+    bool batchAvailable = false;
+    bool batchingEnabled = false;
+    size_t maxBatchSigs = 0;
+};
 
 
 
